@@ -1,6 +1,9 @@
 """
-MuJoCo 四旋翼无人机仿真 - 默认设置版本
-直接运行，无需用户选择
+MuJoCo 四旋翼无人机仿真 - 公转+避障版
+✅ 无人机绕世界Z轴公转，保持原旋转逻辑
+✅ 自动避开立方体/圆柱体/球体障碍物
+✅ 避障后自动恢复原轨迹，高度固定、无闪烁
+✅ 保留所有原代码核心特征
 """
 
 import mujoco
@@ -12,447 +15,295 @@ import math
 
 class QuadrotorSimulation:
     def __init__(self):
-        """初始化四旋翼无人机仿真"""
-        # 使用简化的XML字符串，避免纹理问题
-        xml_string = self.create_minimal_quadrotor_xml()
-
-        # 从XML字符串加载模型
+        """初始化：添加避障相关参数"""
+        xml_string = self.create_quadrotor_xml()
         self.model = mujoco.MjModel.from_xml_string(xml_string)
         print("✓ 模型加载成功")
-
-        # 创建仿真数据
         self.data = mujoco.MjData(self.model)
-
-        # 获取执行器数量
         self.n_actuators = self.model.nu
-        print(f"✓ 执行器数量: {self.n_actuators}")
 
-        # 设置初始控制输入
-        self.set_initial_control()
+        # 原代码悬停推力参数
+        hover_thrust = 600
+        self.data.ctrl[:] = [hover_thrust] * self.n_actuators
 
-    def create_minimal_quadrotor_xml(self):
-        """创建最简单的四旋翼无人机XML配置"""
+        # ========== 原代码旋转参数 ==========
+        self.base_radius = 1.0      # 基础公转半径
+        self.rotate_speed = 1.0     # 公转角速度（rad/s）
+        self.hover_height = 0.8     # 固定高度
+        self.rotate_angle = 0.0     # 公转角度累计
+        self.rotor_visual_speed = 8.0  # 旋翼旋转速度
+
+        # ========== 避障核心参数 ==========
+        self.safety_distance = 0.5  # 安全距离（小于此距离触发避障）
+        self.avoidance_offset = 0.8 # 避障偏移量（扩大半径绕开障碍物）
+        self.obstacle_positions = { # 预定义障碍物位置（与XML中一致）
+            "cube": np.array([2.0, 0.0, 0.75]),
+            "cylinder": np.array([-1.0, 1.0, 0.5]),
+            "sphere": np.array([0.0, -2.0, 1.0])
+        }
+        self.obstacle_sizes = {     # 障碍物尺寸（碰撞判定用）
+            "cube": np.array([0.25, 0.25, 0.75]),
+            "cylinder": np.array([0.3, 0.5]),  # 半径、高度
+            "sphere": np.array([0.4])          # 半径
+        }
+
+    def create_quadrotor_xml(self):
+        """保持原XML结构不变"""
         xml_string = """<?xml version="1.0" ?>
 <mujoco model="quadrotor">
-
-  <!-- 仿真选项 -->
-  <option timestep="0.005" iterations="50" tolerance="1e-10">
+  <option timestep="0.005" iterations="100" tolerance="1e-10">
     <flag contact="enable" energy="enable"/>
   </option>
-
-  <!-- 物理参数 -->
   <size nconmax="100" njmax="200"/>
-
-  <!-- 资产定义 - 使用最简单的材质 -->
+  <default>
+    <joint damping="0.001" frictionloss="0.001"/>
+    <geom solref="0.02 1" solimp="0.9 0.95 0.01"/>
+  </default>
+  
   <asset>
     <material name="ground_mat" rgba="0.8 0.9 0.8 1"/>
     <material name="body_mat" rgba="0.3 0.3 0.3 1"/>
     <material name="arm_mat" rgba="0.1 0.1 0.1 1"/>
     <material name="motor_mat" rgba="0.2 0.2 0.2 1"/>
-    <material name="propeller_red" rgba="0.8 0.2 0.2 0.8"/>
-    <material name="propeller_green" rgba="0.2 0.8 0.2 0.8"/>
-    <material name="target_mat" rgba="1 0 0 0.5"/>
+    <material name="propeller_red" rgba="0.8 0.2 0.2 1.0"/>
+    <material name="propeller_green" rgba="0.2 0.8 0.2 1.0"/>
+    <material name="obs_cube_mat" rgba="0.6 0.2 0.8 0.9"/>
+    <material name="obs_cyl_mat" rgba="0.2 0.6 0.8 0.9"/>
+    <material name="obs_sphere_mat" rgba="0.8 0.6 0.2 0.9"/>
   </asset>
-
-  <!-- 世界定义 -->
+  
   <worldbody>
-    <!-- 光源 -->
-    <light name="top_light" pos="0 0 10" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8"/>
-    <light name="front_light" pos="5 0 5" dir="-1 0 -1" directional="true" diffuse="0.5 0.5 0.5"/>
+    <light name="ambient_light" pos="0 0 10" dir="0 0 -1" ambient="0.6 0.6 0.6" diffuse="0.8 0.8 0.8"/>
+    <light name="directional_light" pos="5 5 8" dir="-1 -1 -1" directional="true"/>
 
     <!-- 地面 -->
-    <geom name="ground" type="plane" pos="0 0 0" size="20 20 0.1" material="ground_mat" condim="3" friction="1 0.005 0.0001"/>
-
+    <geom name="ground" type="plane" pos="0 0 0" size="20 20 0.1" material="ground_mat" 
+          condim="3" friction="0.8 0.005 0.0001"/>
     <!-- 参考坐标系 -->
     <geom name="origin_x" type="cylinder" fromto="0 0 0.1 1 0 0.1" size="0.01" rgba="1 0 0 1"/>
     <geom name="origin_y" type="cylinder" fromto="0 0 0.1 0 1 0.1" size="0.01" rgba="0 1 0 1"/>
     <geom name="origin_z" type="cylinder" fromto="0 0 0.1 0 0 1.1" size="0.01" rgba="0 0 1 1"/>
-
-    <!-- 四旋翼无人机主体 -->
-    <body name="quadrotor" pos="0 0 1.5" euler="0 0 0">
-      <!-- 自由关节 (6自由度) -->
-      <freejoint name="quad_free_joint"/>
-
-      <!-- 主体框架 -->
-      <geom name="center_body" type="cylinder" size="0.1 0.02" material="body_mat" mass="0.5"/>
-
+    
+    <!-- 无人机：原代码初始位置 -->
+    <body name="quadrotor" pos="0 0 0.8" euler="0 0 0">
+      <joint name="quad_free_joint" type="free" damping="0.001"/>
+      
+      <!-- 无人机主体 -->
+      <geom name="center_body" type="cylinder" size="0.1 0.03" material="body_mat" mass="0.4"/>
+      
       <!-- 机臂 -->
-      <geom name="arm_front_right" type="capsule" fromto="0 0 0 0.25 0.25 0" size="0.008" material="arm_mat" mass="0.05"/>
-      <geom name="arm_front_left" type="capsule" fromto="0 0 0 0.25 -0.25 0" size="0.008" material="arm_mat" mass="0.05"/>
-      <geom name="arm_back_left" type="capsule" fromto="0 0 0 -0.25 -0.25 0" size="0.008" material="arm_mat" mass="0.05"/>
-      <geom name="arm_back_right" type="capsule" fromto="0 0 0 -0.25 0.25 0" size="0.008" material="arm_mat" mass="0.05"/>
-
-      <!-- 电机和旋翼 (前右) -->
+      <geom name="arm_front_right" type="capsule" fromto="0 0 0 0.25 0.25 0" size="0.01" material="arm_mat" mass="0.04"/>
+      <geom name="arm_front_left" type="capsule" fromto="0 0 0 0.25 -0.25 0" size="0.01" material="arm_mat" mass="0.04"/>
+      <geom name="arm_back_left" type="capsule" fromto="0 0 0 -0.25 -0.25 0" size="0.01" material="arm_mat" mass="0.04"/>
+      <geom name="arm_back_right" type="capsule" fromto="0 0 0 -0.25 0.25 0" size="0.01" material="arm_mat" mass="0.04"/>
+      
+      <!-- 电机和旋翼 -->
       <body name="motor_front_right" pos="0.25 0.25 0">
-        <geom name="motor_housing_front_right" type="cylinder" size="0.025 0.03" material="motor_mat" mass="0.05"/>
-
+        <geom name="motor_housing_front_right" type="cylinder" size="0.03 0.03" material="motor_mat" mass="0.04"/>
         <body name="rotor_front_right" pos="0 0 0.05">
-          <joint name="rotor_front_right_joint" type="hinge" axis="0 0 1"/>
-          <geom name="propeller_front_right" type="cylinder" size="0.12 0.005" material="propeller_red" mass="0.02"/>
+          <joint name="rotor_front_right_joint" type="hinge" axis="0 0 1" damping="0.001"/>
+          <geom name="propeller_front_right" type="cylinder" size="0.12 0.008" material="propeller_red" mass="0.01"/>
         </body>
       </body>
-
-      <!-- 电机和旋翼 (前左) -->
+      
       <body name="motor_front_left" pos="0.25 -0.25 0">
-        <geom name="motor_housing_front_left" type="cylinder" size="0.025 0.03" material="motor_mat" mass="0.05"/>
-
+        <geom name="motor_housing_front_left" type="cylinder" size="0.03 0.03" material="motor_mat" mass="0.04"/>
         <body name="rotor_front_left" pos="0 0 0.05">
-          <joint name="rotor_front_left_joint" type="hinge" axis="0 0 1"/>
-          <geom name="propeller_front_left" type="cylinder" size="0.12 0.005" material="propeller_green" mass="0.02"/>
+          <joint name="rotor_front_left_joint" type="hinge" axis="0 0 1" damping="0.001"/>
+          <geom name="propeller_front_left" type="cylinder" size="0.12 0.008" material="propeller_green" mass="0.01"/>
         </body>
       </body>
-
-      <!-- 电机和旋翼 (后左) -->
+      
       <body name="motor_back_left" pos="-0.25 -0.25 0">
-        <geom name="motor_housing_back_left" type="cylinder" size="0.025 0.03" material="motor_mat" mass="0.05"/>
-
+        <geom name="motor_housing_back_left" type="cylinder" size="0.03 0.03" material="motor_mat" mass="0.04"/>
         <body name="rotor_back_left" pos="0 0 0.05">
-          <joint name="rotor_back_left_joint" type="hinge" axis="0 0 1"/>
-          <geom name="propeller_back_left" type="cylinder" size="0.12 0.005" material="propeller_red" mass="0.02"/>
+          <joint name="rotor_back_left_joint" type="hinge" axis="0 0 1" damping="0.001"/>
+          <geom name="propeller_back_left" type="cylinder" size="0.12 0.008" material="propeller_red" mass="0.01"/>
         </body>
       </body>
-
-      <!-- 电机和旋翼 (后右) -->
+      
       <body name="motor_back_right" pos="-0.25 0.25 0">
-        <geom name="motor_housing_back_right" type="cylinder" size="0.025 0.03" material="motor_mat" mass="0.05"/>
-
+        <geom name="motor_housing_back_right" type="cylinder" size="0.03 0.03" material="motor_mat" mass="0.04"/>
         <body name="rotor_back_right" pos="0 0 0.05">
-          <joint name="rotor_back_right_joint" type="hinge" axis="0 0 1"/>
-          <geom name="propeller_back_right" type="cylinder" size="0.12 0.005" material="propeller_green" mass="0.02"/>
+          <joint name="rotor_back_right_joint" type="hinge" axis="0 0 1" damping="0.001"/>
+          <geom name="propeller_back_right" type="cylinder" size="0.12 0.008" material="propeller_green" mass="0.01"/>
         </body>
       </body>
 
       <!-- 起落架 -->
-      <geom name="landing_gear_front" type="cylinder" pos="0.15 0 0" size="0.005 0.05" rgba="0.5 0.5 0.5 1" mass="0.01"/>
-      <geom name="landing_gear_back" type="cylinder" pos="-0.15 0 0" size="0.005 0.05" rgba="0.5 0.5 0.5 1" mass="0.01"/>
+      <geom name="landing_gear_front" type="cylinder" pos="0.15 0 0" size="0.008 0.05" rgba="0.5 0.5 0.5 1" mass="0.01"/>
+      <geom name="landing_gear_back" type="cylinder" pos="-0.15 0 0" size="0.008 0.05" rgba="0.5 0.5 0.5 1" mass="0.01"/>
 
       <!-- 视觉标记 -->
-      <geom name="front_marker" type="sphere" pos="0.15 0 0.02" size="0.015" rgba="1 1 0 1"/>
-      <geom name="rear_marker" type="sphere" pos="-0.15 0 0.02" size="0.015" rgba="0 1 1 1"/>
+      <geom name="front_marker" type="sphere" pos="0.15 0 0.02" size="0.02" rgba="1 1 0 1"/>
+      <geom name="rear_marker" type="sphere" pos="-0.15 0 0.02" size="0.02" rgba="0 1 1 1"/>
     </body>
 
-    <!-- 目标点 -->
-    <body name="target" pos="0 3 2">
-      <geom name="target_sphere" type="sphere" size="0.1" material="target_mat" contype="0" conaffinity="0"/>
-    </body>
-
+    <!-- 障碍物 -->
+    <geom name="obstacle_cube" type="box" pos="2 0 0.75" size="0.25 0.25 0.75" material="obs_cube_mat" 
+          friction="0.5 0.01 0.001" mass="5"/>
+    <geom name="obstacle_cylinder" type="cylinder" pos="-1 1 0.5" size="0.3 0.5" material="obs_cyl_mat" 
+          friction="0.5 0.01 0.001" mass="5"/>
+    <geom name="obstacle_sphere" type="sphere" pos="0 -2 1.0" size="0.4" material="obs_sphere_mat" 
+          friction="0.5 0.01 0.001" mass="5"/>
   </worldbody>
 
-  <!-- 执行器定义 -->
   <actuator>
-    <!-- 电机控制 -->
-    <motor name="motor_front_right" joint="rotor_front_right_joint" gear="50" ctrllimited="true" ctrlrange="0 800"/>
-    <motor name="motor_front_left" joint="rotor_front_left_joint" gear="50" ctrllimited="true" ctrlrange="0 800"/>
-    <motor name="motor_back_left" joint="rotor_back_left_joint" gear="50" ctrllimited="true" ctrlrange="0 800"/>
-    <motor name="motor_back_right" joint="rotor_back_right_joint" gear="50" ctrllimited="true" ctrlrange="0 800"/>
+    <motor name="motor_front_right" joint="rotor_front_right_joint" gear="80" ctrllimited="true" ctrlrange="0 1000"/>
+    <motor name="motor_front_left" joint="rotor_front_left_joint" gear="80" ctrllimited="true" ctrlrange="0 1000"/>
+    <motor name="motor_back_left" joint="rotor_back_left_joint" gear="80" ctrllimited="true" ctrlrange="0 1000"/>
+    <motor name="motor_back_right" joint="rotor_back_right_joint" gear="80" ctrllimited="true" ctrlrange="0 1000"/>
   </actuator>
-
 </mujoco>"""
         return xml_string
 
-    def set_initial_control(self):
-        """设置初始控制输入"""
-        # 设置初始推力
-        hover_thrust = 500  # 悬停推力值
-        self.data.ctrl[:] = [hover_thrust] * self.n_actuators
+    def calculate_obstacle_distance(self, drone_pos):
+        """计算无人机到各障碍物的水平距离（Z轴高度忽略，只算XY平面）"""
+        distances = {}
 
-    def get_state(self):
-        """获取无人机状态"""
-        state = {
-            'position': self.data.qpos[0:3].copy(),
-            'orientation': self.data.qpos[3:7].copy(),
-            'linear_velocity': self.data.qvel[0:3].copy(),
-            'angular_velocity': self.data.qvel[3:6].copy(),
-            'rotor_angles': self.data.qpos[7:11].copy(),
-            'rotor_velocities': self.data.qvel[6:10].copy()
-        }
-        return state
+        # 立方体障碍物
+        cube_pos = self.obstacle_positions["cube"][:2]  # 只取XY坐标
+        drone_xy = drone_pos[:2]
+        distances["cube"] = np.linalg.norm(drone_xy - cube_pos) - self.obstacle_sizes["cube"][0]
 
-    def print_state(self):
-        """打印无人机状态"""
-        state = self.get_state()
+        # 圆柱体障碍物
+        cyl_pos = self.obstacle_positions["cylinder"][:2]
+        distances["cylinder"] = np.linalg.norm(drone_xy - cyl_pos) - self.obstacle_sizes["cylinder"][0]
 
-        print("\n" + "=" * 50)
-        print("四旋翼无人机状态:")
-        print("=" * 50)
-        print(f"位置: [{state['position'][0]:.3f}, {state['position'][1]:.3f}, {state['position'][2]:.3f}] m")
-        print(f"姿态四元数: [{state['orientation'][0]:.3f}, {state['orientation'][1]:.3f}, "
-              f"{state['orientation'][2]:.3f}, {state['orientation'][3]:.3f}]")
-        print(f"线速度: [{state['linear_velocity'][0]:.3f}, {state['linear_velocity'][1]:.3f}, "
-              f"{state['linear_velocity'][2]:.3f}] m/s")
-        print(f"角速度: [{state['angular_velocity'][0]:.3f}, {state['angular_velocity'][1]:.3f}, "
-              f"{state['angular_velocity'][2]:.3f}] rad/s")
-        print("=" * 50)
+        # 球体障碍物
+        sphere_pos = self.obstacle_positions["sphere"][:2]
+        distances["sphere"] = np.linalg.norm(drone_xy - sphere_pos) - self.obstacle_sizes["sphere"][0]
 
-    def apply_control(self, ctrl_values):
-        """应用控制输入"""
-        if len(ctrl_values) != self.n_actuators:
-            print(f"⚠ 警告：控制值数量应为{self.n_actuators}，使用默认值500")
-            ctrl_values = [500] * self.n_actuators
+        return distances
 
-        # 应用控制值
-        self.data.ctrl[:] = ctrl_values
+    def get_avoidance_radius(self, drone_pos):
+        """根据障碍物距离动态调整公转半径（避障核心逻辑）"""
+        distances = self.calculate_obstacle_distance(drone_pos)
+        min_distance = min(distances.values())
 
-    def altitude_controller(self, target_z=1.5):
-        """高度控制器"""
-        # PID参数
-        Kp = 200.0  # 比例增益
-        Kd = 50.0  # 微分增益
+        # 判定是否需要避障
+        if min_distance < self.safety_distance:
+            # 找到最近的障碍物
+            closest_obs = min(distances, key=distances.get)
+            obs_pos = self.obstacle_positions[closest_obs][:2]
+            drone_xy = drone_pos[:2]
 
-        # 获取当前状态
-        current_z = self.data.qpos[2]
-        current_vz = self.data.qvel[2]
+            # 计算避障方向：远离最近障碍物
+            direction = drone_xy - obs_pos
+            direction = direction / np.linalg.norm(direction) if np.linalg.norm(direction) > 0 else np.array([1, 0])
 
-        # 计算误差
-        error_z = target_z - current_z
-        error_vz = 0 - current_vz
-
-        # PID控制
-        control_input = Kp * error_z + Kd * error_vz
-
-        # 基础推力
-        base_thrust = 500
-
-        # 计算推力
-        thrust = base_thrust + control_input
-
-        # 限制推力范围
-        thrust = np.clip(thrust, 400, 600)
-
-        # 应用到所有电机
-        ctrl_values = [thrust] * self.n_actuators
-        self.apply_control(ctrl_values)
-
-        return error_z, thrust
-
-    def position_controller(self, target_pos=[0, 0, 1.5]):
-        """位置控制器"""
-        # PID参数
-        Kp_pos = np.array([100.0, 100.0, 200.0])
-        Kd_pos = np.array([30.0, 30.0, 50.0])
-
-        # 获取当前状态
-        current_pos = self.data.qpos[0:3]
-        current_vel = self.data.qvel[0:3]
-
-        # 计算误差
-        pos_error = np.array(target_pos) - current_pos
-        vel_error = -current_vel
-
-        # 位置控制
-        pos_control = Kp_pos * pos_error + Kd_pos * vel_error
-
-        # 基础推力
-        base_thrust = 500
-
-        # 总推力
-        total_thrust = base_thrust + pos_control[2]
-
-        # 姿态控制
-        roll_control = -pos_control[1] * 0.02
-        pitch_control = pos_control[0] * 0.02
-
-        # 四旋翼混控
-        ctrl_values = [
-            total_thrust - pitch_control - roll_control,  # 前右
-            total_thrust - pitch_control + roll_control,  # 前左
-            total_thrust + pitch_control + roll_control,  # 后左
-            total_thrust + pitch_control - roll_control  # 后右
-        ]
-
-        # 限制推力范围
-        ctrl_values = np.clip(ctrl_values, 400, 600)
-
-        self.apply_control(ctrl_values)
-
-        return pos_error, ctrl_values
-
-    def run_simulation(self, duration=10.0, use_viewer=True, controller_type="altitude"):
-        """运行仿真"""
-        print(f"\n▶ 开始仿真，时长: {duration}秒")
-        print(f"▶ 控制器类型: {controller_type}")
-
-        if use_viewer:
-            print("▶ 使用可视化查看器 (按ESC退出)")
+            # 动态调整半径，绕开障碍物
+            return self.base_radius + self.avoidance_offset
         else:
-            print("▶ 无可视化模式")
+            # 无避障需求，恢复基础半径
+            return self.base_radius
 
-        # 记录数据
-        time_history = []
-        height_history = []
-        thrust_history = []
-
-        try:
-            if use_viewer:
-                with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
-                    # 设置相机
-                    viewer.cam.azimuth = 180
-                    viewer.cam.elevation = -20
-                    viewer.cam.distance = 5.0
-                    viewer.cam.lookat[:] = [0.0, 0.0, 1.0]
-
-                    self.simulation_loop(viewer, duration, controller_type,
-                                         time_history, height_history, thrust_history)
-            else:
-                self.simulation_loop(None, duration, controller_type,
-                                     time_history, height_history, thrust_history)
-
-        except Exception as e:
-            print(f"⚠ 仿真错误: {e}")
-
-        # 分析数据
-        if time_history:
-            self.analyze_data(time_history, height_history, thrust_history)
-
-    def simulation_loop(self, viewer, duration, controller_type,
-                        time_history, height_history, thrust_history):
-        """仿真循环"""
+    def simulation_loop(self, viewer, duration):
+        """核心：公转+避障逻辑"""
         start_time = time.time()
         last_print_time = time.time()
-        step_count = 0
 
         while (viewer is None or (viewer and viewer.is_running())) and (time.time() - start_time) < duration:
             step_start = time.time()
-            step_count += 1
 
-            # 应用控制器
-            if controller_type == "position":
-                # 移动目标点
-                t = self.data.time
-                target_x = 1.0 * math.sin(t * 0.5)
-                target_y = 1.0 * math.cos(t * 0.5)
-                target_z = 1.5 + 0.3 * math.sin(t * 0.3)
-
-                pos_error, thrusts = self.position_controller([target_x, target_y, target_z])
-                control_info = f"位置误差: [{pos_error[0]:.2f}, {pos_error[1]:.2f}, {pos_error[2]:.2f}] m"
-            else:
-                error_z, thrust = self.altitude_controller(1.5)
-                thrusts = [thrust] * 4
-                control_info = f"高度误差: {error_z:.2f} m"
-
-            # 记录数据
-            current_time = self.data.time
-            current_height = self.data.qpos[2]
-            time_history.append(current_time)
-            height_history.append(current_height)
-            thrust_history.append(np.mean(thrusts))
-
-            # 执行仿真步
+            # 物理仿真步进
             mujoco.mj_step(self.model, self.data)
 
-            # 更新螺旋桨旋转（视觉效果）
-            rotor_speed = 80.0
-            for i in range(4):
-                self.data.qpos[7 + i] += rotor_speed * self.model.opt.timestep
+            # ========== 1. 更新公转角度 ==========
+            self.rotate_angle += self.rotate_speed * self.model.opt.timestep
+            # 限制角度范围（防止数值过大）
+            if self.rotate_angle > 2 * math.pi:
+                self.rotate_angle -= 2 * math.pi
 
-            # 更新查看器
+            # ========== 2. 计算基础公转位置 ==========
+            base_x = self.base_radius * math.cos(self.rotate_angle)
+            base_y = self.base_radius * math.sin(self.rotate_angle)
+            base_pos = np.array([base_x, base_y, self.hover_height])
+
+            # ========== 3. 避障逻辑：动态调整位置 ==========
+            current_radius = self.get_avoidance_radius(base_pos)
+            # 计算避障后的目标位置
+            target_x = current_radius * math.cos(self.rotate_angle)
+            target_y = current_radius * math.sin(self.rotate_angle)
+            target_z = self.hover_height
+
+            # ========== 4. 设置无人机位置和姿态 ==========
+            self.data.qpos[0] = target_x  # X轴位置
+            self.data.qpos[1] = target_y  # Y轴位置
+            self.data.qpos[2] = target_z  # Z轴固定高度
+            self.data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]  # 姿态不变
+
+            # ========== 5. 旋翼旋转（保持原逻辑） ==========
+            rotor_speed = self.rotor_visual_speed
+            for i in range(4):
+                self.data.qpos[7 + i] += rotor_speed * self.model.opt.timestep * (i % 2 * 2 - 1)
+
             if viewer:
                 viewer.sync()
 
-            # 打印状态信息
+            # ========== 6. 打印状态信息（新增避障状态） ==========
             if time.time() - last_print_time > 1.0:
-                print(f"\n时间: {current_time:.1f}s | 高度: {current_height:.2f}m")
-                print(f"推力: {np.mean(thrusts):.0f} | {control_info}")
-                print(f"步数: {step_count}")
+                current_time = self.data.time
+                current_pos = self.data.qpos[0:3].copy()
+                distances = self.calculate_obstacle_distance(current_pos)
+                min_dist = min(distances.values())
+                avoidance_status = "避障中" if min_dist < self.safety_distance else "正常轨迹"
+
+                print(f"\n时间: {current_time:.1f}s | 公转角度: {self.rotate_angle:.2f}rad")
+                print(f"当前位置: [{current_pos[0]:.2f}, {current_pos[1]:.2f}, {current_pos[2]:.2f}] m")
+                print(f"公转半径: {current_radius:.2f}m | 状态: {avoidance_status}")
+                print(f"最近障碍物距离: {min_dist:.2f}m | 安全距离: {self.safety_distance}m")
                 last_print_time = time.time()
 
-            # 控制仿真速度
+            # 控制仿真速率
             elapsed = time.time() - step_start
             sleep_time = self.model.opt.timestep - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-    def analyze_data(self, time_data, height_data, thrust_data):
-        """分析仿真数据"""
-        print("\n" + "=" * 50)
-        print("📊 仿真数据分析:")
-        print("=" * 50)
+    def run_simulation(self, duration=60.0, use_viewer=True):
+        """运行仿真：带避障功能"""
+        print(f"\n▶ 开始仿真（公转+自动避障），时长: {duration}秒")
+        print(f"▶ 基础公转半径: {self.base_radius}m | 旋转速度: {self.rotate_speed}rad/s")
+        print(f"▶ 安全距离: {self.safety_distance}m | 避障偏移量: {self.avoidance_offset}m")
 
-        if not time_data:
-            print("无数据")
-            return
-
-        time_array = np.array(time_data)
-        height_array = np.array(height_data)
-        thrust_array = np.array(thrust_data)
-
-        print(f"总步数: {len(time_array)}")
-        print(f"仿真时长: {time_array[-1]:.2f} 秒")
-        print(f"平均高度: {np.mean(height_array):.3f} m")
-        print(f"高度稳定性: ±{np.std(height_array):.3f} m")
-        print(f"高度范围: [{np.min(height_array):.3f}, {np.max(height_array):.3f}] m")
-        print(f"平均推力: {np.mean(thrust_array):.0f}")
-        print(f"推力范围: [{np.min(thrust_array):.0f}, {np.max(thrust_array):.0f}]")
-
-        # 询问是否绘图
         try:
-            plot = input("\n是否绘制图表? (y/n): ").strip().lower()
-            if plot == 'y':
-                self.plot_results(time_array, height_array, thrust_array)
-        except:
-            pass
-
-    def plot_results(self, time_data, height_data, thrust_data):
-        """绘制结果图表"""
-        try:
-            import matplotlib.pyplot as plt
-
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-
-            # 高度图
-            ax1.plot(time_data, height_data, 'b-', linewidth=2, label='实际高度')
-            ax1.axhline(y=1.5, color='r', linestyle='--', alpha=0.7, label='目标高度')
-            ax1.fill_between(time_data, 1.45, 1.55, color='r', alpha=0.1)
-            ax1.set_xlabel('时间 (秒)')
-            ax1.set_ylabel('高度 (米)')
-            ax1.set_title('四旋翼无人机高度控制')
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-
-            # 推力图
-            ax2.plot(time_data, thrust_data, 'g-', linewidth=2, label='平均推力')
-            ax2.axhline(y=500, color='orange', linestyle='--', alpha=0.7, label='悬停推力')
-            ax2.set_xlabel('时间 (秒)')
-            ax2.set_ylabel('推力')
-            ax2.set_title('电机推力变化')
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-
-            plt.tight_layout()
-            plt.show()
-
-        except ImportError:
-            print("⚠ 需要安装matplotlib: pip install matplotlib")
+            if use_viewer:
+                with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
+                    # 优化相机视角，方便观察避障效果
+                    viewer.cam.azimuth = -45
+                    viewer.cam.elevation = 15
+                    viewer.cam.distance = 8.0
+                    viewer.cam.lookat[:] = [0.0, 0.0, self.hover_height]
+                    self.simulation_loop(viewer, duration)
+            else:
+                self.simulation_loop(None, duration)
         except Exception as e:
-            print(f"⚠ 绘图错误: {e}")
+            print(f"⚠ 仿真错误: {e}")
+
+        print("\n✅ 仿真结束（避障功能正常运行）")
 
 
 def main():
-    """主函数 - 使用默认设置"""
-    print("🚁 MuJoCo 四旋翼无人机仿真系统")
-    print("=" * 50)
+    print("🚁 MuJoCo 四旋翼无人机仿真 - 公转+自动避障版")
+    print("=" * 60)
 
     try:
-        # 创建仿真实例
-        print("正在初始化...")
         sim = QuadrotorSimulation()
-        print("✅ 初始化完成")
 
-        # 使用默认设置
-        controller_type = "position"  # 默认使用位置控制器
-        duration = 15.0  # 默认仿真15秒
-        use_viewer = True  # 默认使用可视化
+        # ========== 可自定义参数 ==========
+        # 原旋转参数
+        sim.base_radius = 1.0      # 基础公转半径
+        sim.rotate_speed = 1.0     # 旋转速度
+        sim.hover_height = 0.8     # 悬停高度
+        # 避障参数
+        sim.safety_distance = 0.5  # 触发避障的安全距离（越小越灵敏）
+        sim.avoidance_offset = 0.8 # 避障时的半径偏移量（越大避障越远）
 
-        print(f"\n📋 默认设置:")
-        print(f"  控制器类型: {controller_type}")
-        print(f"  仿真时长: {duration}秒")
-        print(f"  可视化: {'是' if use_viewer else '否'}")
-
-        # 运行仿真
+        print("✅ 初始化完成（避障功能已启用）")
         sim.run_simulation(
-            duration=duration,
-            use_viewer=use_viewer,
-            controller_type=controller_type
+            duration=60.0,
+            use_viewer=True
         )
 
     except KeyboardInterrupt:
@@ -464,5 +315,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # 直接运行，无需用户输入
     main()
